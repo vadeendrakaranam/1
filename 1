@@ -5,7 +5,6 @@ import pickle
 import face_recognition
 import pandas as pd
 from datetime import datetime
-import threading
 
 app = Flask(__name__)
 
@@ -57,8 +56,12 @@ def enroll():
     return render_template('enroll.html')
 
 def register_face(name, admission_number, mobile_number):
-    # Initialize webcam
-    video_capture = cv2.VideoCapture(0)
+    # Initialize webcam with the correct index
+    video_capture = cv2.VideoCapture(0)  # Index 0
+    if not video_capture.isOpened():
+        print("Error: Could not open video device.")
+        return
+
     print(f"Please look at the camera for face registration...")
 
     # Capture a single frame
@@ -106,7 +109,7 @@ def attendance():
         except pd.errors.EmptyDataError:
             details_df = pd.DataFrame(columns=['Name', 'Admission Number', 'Mobile Number'])
     else:
-        details_df = pd.DataFrame(columns=['Name', 'Admission Number', 'Mobile Number'])
+        details_df = pd.DataFrame(columns(['Name', 'Admission Number', 'Mobile Number']))
 
     # Merge attendance data with details
     df = df.merge(details_df, on='Name', how='left')
@@ -123,7 +126,7 @@ def get_detected_image(filename):
     return send_from_directory('detected_faces', filename)
 
 def detect_faces():
-    video_capture = cv2.VideoCapture(0)
+    video_capture = cv2.VideoCapture(0)  # Use index 0 for the webcam
     if not video_capture.isOpened():
         print("Error: Could not open video device.")
         return
@@ -131,47 +134,43 @@ def detect_faces():
     while True:
         ret, frame = video_capture.read()
         if not ret:
-            print("Error: Failed to capture image.")
             continue
 
         rgb_frame = frame[:, :, ::-1]
         face_locations = face_recognition.face_locations(rgb_frame)
         face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
 
-        if len(face_encodings) == 0:
-            # If no faces are detected, skip displaying the frame
-            continue
-
         for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
             matches = face_recognition.compare_faces(known_faces, face_encoding)
             name = "Unknown"
+            color = (0, 0, 255)  # Red color for unknown
+
             if True in matches:
                 first_match_index = matches.index(True)
                 name = known_names[first_match_index]
+                color = (0, 255, 0)  # Green color for recognized
 
-                # Update attendance if known person is detected
+                # Save detected image if the face is recognized
+                detected_image_path = f'detected_faces/{name}.jpg'
+                cv2.imwrite(detected_image_path, frame)
+                
+                # Update attendance file
                 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 if not os.path.exists('attendance.csv'):
                     with open('attendance.csv', 'w') as f:
                         f.write('Name,Time\n')
-
+                
                 df = pd.read_csv('attendance.csv')
                 if name not in df['Name'].values:
                     new_row = pd.DataFrame([[name, timestamp]], columns=['Name', 'Time'])
                     df = pd.concat([df, new_row], ignore_index=True)
                     df.to_csv('attendance.csv', index=False)
 
-                # Save detected image
-                detected_image_path = f'detected_faces/{name}.jpg'
-                cv2.imwrite(detected_image_path, frame)
-
             # Draw bounding box and label
-            color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
             cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
             font = cv2.FONT_HERSHEY_DUPLEX
             cv2.putText(frame, name, (left + 6, bottom - 6), font, 0.5, color, 1)
 
-        # Display the frame
         cv2.imshow('Face Detection', frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -181,5 +180,6 @@ def detect_faces():
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
+    import threading
     threading.Thread(target=detect_faces, daemon=True).start()
     app.run(host='0.0.0.0', port=5000, debug=True)
