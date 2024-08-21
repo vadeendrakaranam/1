@@ -4,6 +4,8 @@ import csv
 import numpy as np
 import logging
 import cv2
+import RPi.GPIO as GPIO
+import time
 
 # Path of cropped faces
 path_images_from_camera = "data/data_faces_from_camera/"
@@ -16,6 +18,14 @@ predictor = dlib.shape_predictor('data/data_dlib/shape_predictor_68_face_landmar
 
 # Use Dlib resnet50 model to get 128D face descriptor
 face_reco_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recognition_resnet_model_v1.dat")
+
+# GPIO Setup
+RELAY_PIN = 17  # Define the GPIO pin connected to the relay module
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(RELAY_PIN, GPIO.OUT, initial=GPIO.LOW)  # Set relay pin to LOW (lock closed by default)
+
+# Duration to keep the solenoid lock open (in seconds)
+SOLENOID_OPEN_TIME = 5
 
 # Return 128D features for single image
 def return_128d_features(path_img):
@@ -52,24 +62,61 @@ def return_features_mean_personX(path_face_personX):
         features_mean_personX = np.zeros(128, dtype=object, order='C')
     return features_mean_personX
 
+def open_solenoid_lock():
+    GPIO.output(RELAY_PIN, GPIO.HIGH)  # Activate relay (open lock)
+    logging.info("Solenoid lock opened")
+    time.sleep(SOLENOID_OPEN_TIME)  # Keep lock open for the specified time
+    GPIO.output(RELAY_PIN, GPIO.LOW)  # Deactivate relay (close lock)
+    logging.info("Solenoid lock closed")
+
 def main():
     logging.basicConfig(level=logging.INFO)
     person_list = os.listdir(path_images_from_camera)
     person_list.sort()
 
+    known_faces = []
+
+    for person in person_list:
+        features_mean_personX = return_features_mean_personX(path_images_from_camera + person)
+
+        if len(person.split('_', 2)) == 2:
+            person_name = person
+        else:
+            person_name = person.split('_', 2)[-1]
+
+        features_mean_personX = np.insert(features_mean_personX, 0, person_name, axis=0)
+        known_faces.append(features_mean_personX[1:])  # Store 128D features
+
     with open("data/features_all.csv", "w", newline="") as csvfile:
         writer = csv.writer(csvfile)
-        for person in person_list:
-            features_mean_personX = return_features_mean_personX(path_images_from_camera + person)
-
-            if len(person.split('_', 2)) == 2:
-                person_name = person
-            else:
-                person_name = person.split('_', 2)[-1]
-            features_mean_personX = np.insert(features_mean_personX, 0, person_name, axis=0)
+        for features_mean_personX in known_faces:
             writer.writerow(features_mean_personX)
-            logging.info('\n')
-        logging.info("Save all the features of faces registered into: data/features_all.csv")
+    
+    # Now capture the image and detect if it matches any known faces
+    while True:
+        cap = cv2.VideoCapture(0)
+        ret, frame = cap.read()
+
+        if ret:
+            faces = detector(frame, 1)
+            if faces:
+                for face in faces:
+                    shape = predictor(frame, face)
+                    current_face_descriptor = face_reco_model.compute_face_descriptor(frame, shape)
+
+                    for known_face in known_faces:
+                        # Compare the current face descriptor with known faces
+                        dist = np.linalg.norm(np.array(known_face, dtype=np.float32) - np.array(current_face_descriptor, dtype=np.float32))
+                        if dist < 0.6:  # Threshold for face recognition (tune as needed)
+                            logging.info("Recognized face: Opening lock...")
+                            open_solenoid_lock()
+                            break
+
+        cap.release()
+        time.sleep(1)  # Wait a bit before capturing the next frame to prevent overload
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    finally:
+        GPIO.cleanup()  # Cleanup GPIO on exit
