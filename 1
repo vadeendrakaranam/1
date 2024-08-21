@@ -25,20 +25,20 @@ GPIO.setmode(GPIO.BCM)
 GPIO.setup(RELAY_PIN, GPIO.OUT, initial=GPIO.LOW)  # Set relay pin to LOW (lock closed by default)
 
 # Duration to keep the solenoid lock open (in seconds)
-SOLENOID_OPEN_TIME = 5
+SOLENOID_OPEN_TIME = 10
 
 # Return 128D features for single image
 def return_128d_features(path_img):
     img_rd = cv2.imread(path_img)
     faces = detector(img_rd, 1)
-    logging.info("%-40s %-20s", " Image with faces detected:", path_img)
+    logging.info("%-40s %-20s", "Image with faces detected:", path_img)
 
     if len(faces) != 0:
         shape = predictor(img_rd, faces[0])
         face_descriptor = face_reco_model.compute_face_descriptor(img_rd, shape)
     else:
         face_descriptor = 0
-        logging.warning("no face")
+        logging.warning("No face detected in image: %s", path_img)
     return face_descriptor
 
 # Return the mean value of 128D face descriptor for person X
@@ -46,15 +46,13 @@ def return_features_mean_personX(path_face_personX):
     features_list_personX = []
     photos_list = os.listdir(path_face_personX)
     if photos_list:
-        for i in range(len(photos_list)):
-            logging.info("%-40s %-20s", " / Reading image:", path_face_personX + "/" + photos_list[i])
-            features_128d = return_128d_features(path_face_personX + "/" + photos_list[i])
-            if features_128d == 0:
-                i += 1
-            else:
+        for photo in photos_list:
+            logging.info("%-40s %-20s", "Reading image:", path_face_personX + "/" + photo)
+            features_128d = return_128d_features(path_face_personX + "/" + photo)
+            if features_128d is not None:
                 features_list_personX.append(features_128d)
     else:
-        logging.warning(" Warning: No images in%s/", path_face_personX)
+        logging.warning("No images in %s", path_face_personX)
 
     if features_list_personX:
         features_mean_personX = np.array(features_list_personX, dtype=object).mean(axis=0)
@@ -93,8 +91,8 @@ def main():
             writer.writerow(features_mean_personX)
     
     # Now capture the image and detect if it matches any known faces
+    cap = cv2.VideoCapture(0)
     while True:
-        cap = cv2.VideoCapture(0)
         ret, frame = cap.read()
 
         if ret:
@@ -103,17 +101,32 @@ def main():
                 for face in faces:
                     shape = predictor(frame, face)
                     current_face_descriptor = face_reco_model.compute_face_descriptor(frame, shape)
-
+                    
                     for known_face in known_faces:
                         # Compare the current face descriptor with known faces
                         dist = np.linalg.norm(np.array(known_face, dtype=np.float32) - np.array(current_face_descriptor, dtype=np.float32))
                         if dist < 0.6:  # Threshold for face recognition (tune as needed)
                             logging.info("Recognized face: Opening lock...")
                             open_solenoid_lock()
+                            
+                            # Draw rectangle around the detected face
+                            (x, y, w, h) = (face.left(), face.top(), face.width(), face.height())
+                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                            
+                            # Show the frame with the detected face
+                            cv2.imshow("Face Detected", frame)
+                            cv2.waitKey(1)  # Display the window for a short time
+                            
+                            time.sleep(SOLENOID_OPEN_TIME)  # Keep the lock open for the specified time
                             break
 
-        cap.release()
-        time.sleep(1)  # Wait a bit before capturing the next frame to prevent overload
+        # Display the frame with detected faces
+        cv2.imshow("Face Detection", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
 
 if __name__ == '__main__':
     try:
