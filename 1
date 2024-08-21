@@ -1,19 +1,12 @@
-import os
 import dlib
 import numpy as np
 import cv2
+import os
 import pandas as pd
-import sqlite3
-import datetime
 import time
 import logging
-import RPi.GPIO as GPIO
-
-# GPIO Setup
-RELAY_PIN = 17  # Define the GPIO pin connected to the relay module
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(RELAY_PIN, GPIO.OUT, initial=GPIO.LOW)  # Set relay pin to LOW (lock closed by default)
-SOLENOID_OPEN_TIME = 10  # Duration to keep the solenoid lock open (in seconds)
+import sqlite3
+import datetime
 
 # Dlib: Use frontal face detector
 detector = dlib.get_frontal_face_detector()
@@ -37,6 +30,7 @@ cursor.execute(create_table_sql)
 # Commit changes and close the connection
 conn.commit()
 conn.close()
+
 
 class Face_Recognizer:
     def __init__(self):
@@ -88,15 +82,23 @@ class Face_Recognizer:
         if os.path.exists("data/features_all.csv"):
             path_features_known_csv = "data/features_all.csv"
             csv_rd = pd.read_csv(path_features_known_csv, header=None)
+            
+            print("CSV File Columns:", csv_rd.columns)  # Print column indices
+            print("CSV File Head:", csv_rd.head())  # Print the first few rows to check structure
+            
             for i in range(csv_rd.shape[0]):
                 features_someone_arr = []
                 self.face_name_known_list.append(csv_rd.iloc[i][0])
-                for j in range(1, 129):
-                    if csv_rd.iloc[i][j] == '':
+                
+                # Adjust to the actual number of columns in your CSV
+                for j in range(1, len(csv_rd.columns)):  # Adjusted to handle actual number of columns
+                    if pd.isna(csv_rd.iloc[i][j]):
                         features_someone_arr.append('0')
                     else:
                         features_someone_arr.append(csv_rd.iloc[i][j])
+                
                 self.face_features_known_list.append(features_someone_arr)
+            
             logging.info("Faces in Database: %d", len(self.face_features_known_list))
             return 1
         else:
@@ -168,13 +170,6 @@ class Face_Recognizer:
 
         conn.close()
 
-    def open_solenoid_lock(self):
-        GPIO.output(RELAY_PIN, GPIO.HIGH)  # Activate relay (open lock)
-        logging.info("Solenoid lock opened")
-        time.sleep(SOLENOID_OPEN_TIME)  # Keep lock open for the specified time
-        GPIO.output(RELAY_PIN, GPIO.LOW)  # Deactivate relay (close lock)
-        logging.info("Solenoid lock closed")
-
     # Process face detection and recognition from video stream
     def process(self, stream):
         # Get faces known from "features_all.csv"
@@ -188,66 +183,85 @@ class Face_Recognizer:
                 # Detect faces in the frame
                 faces = detector(img_rd, 0)
 
-                self.last_frame_face_name_list = self.current_frame_face_name_list.copy()
-                self.last_frame_face_centroid_list = self.current_frame_face_centroid_list.copy()
+                # Update count for faces in frames
                 self.last_frame_face_cnt = self.current_frame_face_cnt
-                self.current_frame_face_name_list = []
+                self.current_frame_face_cnt = len(faces)
+
+                # Update the face name list in the last frame
+                self.last_frame_face_name_list = self.current_frame_face_name_list[:]
+
+                # Update frame centroid list
+                self.last_frame_face_centroid_list = self.current_frame_face_centroid_list
                 self.current_frame_face_centroid_list = []
-                self.current_frame_face_cnt = 0
 
-                for i, face in enumerate(faces):
-                    shape = predictor(img_rd, face)
-                    face_descriptor = face_reco_model.compute_face_descriptor(img_rd, shape)
-                    face_descriptor = np.array(face_descriptor)
-                    face_descriptor = face_descriptor.reshape((1, -1))
+                # Handle no face changes
+                if (self.current_frame_face_cnt == self.last_frame_face_cnt) and (
+                        self.reclassify_interval_cnt != self.reclassify_interval):
+                    self.reclassify_interval_cnt += 1
 
-                    # Get face bounding box
-                    x1, y1, x2, y2 = (face.left(), face.top(), face.right(), face.bottom())
+                if self.current_frame_face_cnt != 0:
+                    # Face recognition and extraction
+                    for face in faces:
+                        x, y, w, h = (face.left(), face.top(), face.width(), face.height())
+                        face_img = img_rd[y:y + h, x:x + w]
+                        face_descriptor = face_reco_model.compute_face_descriptor(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB))
+                        self.current_frame_face_feature_list.append(list(face_descriptor))
+                        self.current_frame_face_position_list.append((x, y, w, h))
 
-                    # Get face centroid
-                    x_center = int((x1 + x2) / 2)
-                    y_center = int((y1 + y2) / 2)
-                    self.current_frame_face_centroid_list.append([x_center, y_center])
+                        self.current_frame_face_centroid_list.append(
+                            [(x + x + w) / 2, (y + y + h) / 2])
 
-                    # Compute the Euclidean distance between the detected face and known faces
-                    e_distance_list = []
-                    for known_feature in self.face_features_known_list:
-                        e_distance = self.return_euclidean_distance(face_descriptor[0], known_feature)
-                        e_distance_list.append(e_distance)
-
-                    # Find the face with the minimum Euclidean distance
-                    min_e_distance = min(e_distance_list)
-                    min_e_distance_index = e_distance_list.index(min_e_distance)
-                    face_name = self.face_name_known_list[min_e_distance_index]
-
-                    if min_e_distance < 0.6:  # Threshold for recognizing faces
-                        self.current_frame_face_name_list.append(face_name)
-                        self.current_frame_face_cnt += 1
-
-                        # Open the solenoid lock if face is recognized
-                        self.open_solenoid_lock()
-
-                        # Log attendance
-                        self.attendance(face_name)
-                    else:
                         self.current_frame_face_name_list.append("Unknown")
 
-                # Track and match faces between frames
-                if len(self.last_frame_face_centroid_list) > 0:
-                    self.centroid_tracker()
+                    if self.reclassify_interval_cnt == self.reclassify_interval:
+                        # Re-classify known faces
+                        self.reclassify_interval_cnt = 0
 
+                        for i in range(self.current_frame_face_cnt):
+                            self.current_frame_face_X_e_distance_list = []
+
+                            # Calculate the Euclidean distance between the face in the current frame and all known faces
+                            for j in range(len(self.face_features_known_list)):
+                                self.current_frame_face_X_e_distance_list.append(self.return_euclidean_distance(
+                                    self.current_frame_face_feature_list[i],
+                                    self.face_features_known_list[j]
+                                ))
+
+                            # Assign the closest face from known faces
+                            min_distance_index = self.current_frame_face_X_e_distance_list.index(
+                                min(self.current_frame_face_X_e_distance_list))
+                            if min(self.current_frame_face_X_e_distance_list) < 0.6:
+                                self.current_frame_face_name_list[i] = self.face_name_known_list[min_distance_index]
+                                self.attendance(self.face_name_known_list[min_distance_index])
+
+                        # Track face centroids
+                        self.centroid_tracker()
+
+                # Update FPS
+                self.update_fps()
+
+                # Draw information on the frame
                 self.draw_note(img_rd)
-                cv2.imshow('Face Recognizer', img_rd)
 
+                # Display the frame
+                cv2.imshow("Face Recognition", img_rd)
+
+                # Exit the loop if 'q' is pressed
                 if kk == ord('q'):
                     break
 
-                self.update_fps()
-                logging.debug("Frame " + str(self.frame_cnt) + " ends")
             stream.release()
             cv2.destroyAllWindows()
+        else:
+            logging.warning("Cannot process, face database not found!")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
+    # Initialize face recognizer
     face_recognizer = Face_Recognizer()
-    video_capture = cv2.VideoCapture(0)  # Use the default camera
+    
+    # Open video capture
+    video_capture = cv2.VideoCapture(0)
+    
+    # Process video stream
     face_recognizer.process(video_capture)
