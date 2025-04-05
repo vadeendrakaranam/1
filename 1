@@ -1,267 +1,126 @@
+import sys
+import os
+import time
 import dlib
 import numpy as np
 import cv2
-import os
 import pandas as pd
-import time
-import logging
 import sqlite3
 import datetime
+import serial
 
-# Dlib: Use frontal face detector
+# Add the 'lib' folder to Python's module search path
+sys.path.insert(0, os.path.abspath("/home/project/Desktop/Att/lib"))
+
+# Serial port setup (update port if needed)
+ser = serial.Serial('/dev/ttyACM0', 9600, timeout=1)
+time.sleep(2)  # Wait for Arduino to reset
+
+# Dlib face detector and shape predictor
 detector = dlib.get_frontal_face_detector()
-
-# Dlib landmark: Get face landmarks
 predictor = dlib.shape_predictor('data/data_dlib/shape_predictor_68_face_landmarks.dat')
-
-# Dlib Resnet: Use Dlib resnet50 model to get 128D face descriptor
 face_reco_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recognition_resnet_model_v1.dat")
 
-# Create a connection to the database
+# Create attendance table if it doesn't exist
 conn = sqlite3.connect("attendance.db")
 cursor = conn.cursor()
-
-# Create a table for the current date
-current_date = datetime.datetime.now().strftime("%Y_%m_%d")  # Replace hyphens with underscores
-table_name = "attendance"
-create_table_sql = f"CREATE TABLE IF NOT EXISTS {table_name} (name TEXT, time TEXT, date DATE, UNIQUE(name, date))"
-cursor.execute(create_table_sql)
-
-# Commit changes and close the connection
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS attendance (
+        name TEXT,
+        time TEXT,
+        date DATE,
+        UNIQUE(name, date)
+    )
+""")
 conn.commit()
 conn.close()
 
-
-class Face_Recognizer:
+class FaceRecognizer:
     def __init__(self):
+        self.face_features_known_list = []
+        self.face_name_known_list = []
+        self.current_frame_face_name_list = []
         self.font = cv2.FONT_ITALIC
 
-        # FPS
-        self.frame_time = 0
-        self.frame_start_time = 0
-        self.fps = 0
-        self.fps_show = 0
-        self.start_time = time.time()
-
-        # Count for frames
-        self.frame_cnt = 0
-
-        # Save the features of faces in the database
-        self.face_features_known_list = []
-        # Save the name of faces in the database
-        self.face_name_known_list = []
-
-        # Lists to save centroid positions of ROI in frames
-        self.last_frame_face_centroid_list = []
-        self.current_frame_face_centroid_list = []
-
-        # Lists to save names of faces in frames
-        self.last_frame_face_name_list = []
-        self.current_frame_face_name_list = []
-
-        # Count for faces in frames
-        self.last_frame_face_cnt = 0
-        self.current_frame_face_cnt = 0
-
-        # Save the Euclidean distance for face recognition
-        self.current_frame_face_X_e_distance_list = []
-
-        # Save the positions and names of faces captured
-        self.current_frame_face_position_list = []
-        self.current_frame_face_feature_list = []
-
-        # Euclidean distance between centroids of frames
-        self.last_current_frame_centroid_e_distance = 0
-
-        # Reclassify after 'reclassify_interval' frames
-        self.reclassify_interval_cnt = 0
-        self.reclassify_interval = 10
-
-    # Get known faces from "features_all.csv"
     def get_face_database(self):
         if os.path.exists("data/features_all.csv"):
-            path_features_known_csv = "data/features_all.csv"
-            csv_rd = pd.read_csv(path_features_known_csv, header=None)
-            
-            print("CSV File Columns:", csv_rd.columns)  # Print column indices
-            print("CSV File Head:", csv_rd.head())  # Print the first few rows to check structure
-            
+            csv_rd = pd.read_csv("data/features_all.csv", header=None)
             for i in range(csv_rd.shape[0]):
-                features_someone_arr = []
+                features = [csv_rd.iloc[i][j] for j in range(1, 129)]
                 self.face_name_known_list.append(csv_rd.iloc[i][0])
-                
-                # Adjust to the actual number of columns in your CSV
-                for j in range(1, len(csv_rd.columns)):  # Adjusted to handle actual number of columns
-                    if pd.isna(csv_rd.iloc[i][j]):
-                        features_someone_arr.append('0')
-                    else:
-                        features_someone_arr.append(csv_rd.iloc[i][j])
-                
-                self.face_features_known_list.append(features_someone_arr)
-            
-            logging.info("Faces in Database: %d", len(self.face_features_known_list))
-            return 1
+                self.face_features_known_list.append(features)
+            return True
         else:
-            logging.warning("'features_all.csv' not found!")
-            logging.warning("Please run 'get_faces_from_camera.py' and 'features_extraction_to_csv.py' before 'face_reco_from_camera.py'")
-            return 0
+            print("'features_all.csv' not found!")
+            return False
 
-    def update_fps(self):
-        now = time.time()
-        # Refresh fps per second
-        if str(self.start_time).split(".")[0] != str(now).split(".")[0]:
-            self.fps_show = self.fps
-        self.start_time = now
-        self.frame_time = now - self.frame_start_time
-        self.fps = 1.0 / self.frame_time
-        self.frame_start_time = now
+    def return_euclidean_distance(self, feature_1, feature_2):
+        return np.linalg.norm(np.array(feature_1) - np.array(feature_2))
 
-    @staticmethod
-    # Compute the Euclidean distance between two 128D features
-    def return_euclidean_distance(feature_1, feature_2):
-        feature_1 = np.array(feature_1)
-        feature_2 = np.array(feature_2)
-        dist = np.sqrt(np.sum(np.square(feature_1 - feature_2)))
-        return dist
-
-    # Use centroid tracker to link face in current frame with person in last frame
-    def centroid_tracker(self):
-        for i in range(len(self.current_frame_face_centroid_list)):
-            e_distance_current_frame_person_x_list = []
-            # For object 1 in current frame, compute distance with object 1/2/3/4/... in last frame
-            for j in range(len(self.last_frame_face_centroid_list)):
-                self.last_current_frame_centroid_e_distance = self.return_euclidean_distance(
-                    self.current_frame_face_centroid_list[i], self.last_frame_face_centroid_list[j])
-                e_distance_current_frame_person_x_list.append(self.last_current_frame_centroid_e_distance)
-
-            last_frame_num = e_distance_current_frame_person_x_list.index(min(e_distance_current_frame_person_x_list))
-            self.current_frame_face_name_list[i] = self.last_frame_face_name_list[last_frame_num]
-
-    # Draw notes on the cv2 window
-    def draw_note(self, img_rd):
-        # Add some info on windows
-        cv2.putText(img_rd, "Face Recognizer with Deep Learning", (20, 40), self.font, 1, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(img_rd, "Frame:  " + str(self.frame_cnt), (20, 100), self.font, 0.8, (0, 255, 0), 1, cv2.LINE_AA)
-        cv2.putText(img_rd, "FPS:    " + str(self.fps.__round__(2)), (20, 130), self.font, 0.8, (0, 255, 0), 1, cv2.LINE_AA)
-        cv2.putText(img_rd, "Faces:  " + str(self.current_frame_face_cnt), (20, 160), self.font, 0.8, (0, 255, 0), 1, cv2.LINE_AA)
-        cv2.putText(img_rd, "Q: Quit", (20, 450), self.font, 0.8, (255, 255, 255), 1, cv2.LINE_AA)
-
-        for i in range(len(self.current_frame_face_name_list)):
-            img_rd = cv2.putText(img_rd, "Face_" + str(i + 1), tuple(
-                [int(self.current_frame_face_centroid_list[i][0]), int(self.current_frame_face_centroid_list[i][1])]),
-                                 self.font, 0.8, (255, 190, 0), 1, cv2.LINE_AA)
-
-    # Insert data into database
     def attendance(self, name):
         current_date = datetime.datetime.now().strftime('%Y-%m-%d')
         conn = sqlite3.connect("attendance.db")
         cursor = conn.cursor()
-        # Check if the name already has an entry for the current date
         cursor.execute("SELECT * FROM attendance WHERE name = ? AND date = ?", (name, current_date))
         existing_entry = cursor.fetchone()
 
-        if existing_entry:
-            print(f"{name} is already marked as present for {current_date}")
-        else:
+        if not existing_entry:
             current_time = datetime.datetime.now().strftime('%H:%M:%S')
             cursor.execute("INSERT INTO attendance (name, time, date) VALUES (?, ?, ?)", (name, current_time, current_date))
             conn.commit()
-            print(f"{name} marked as present for {current_date} at {current_time}")
-
+            print(f"{name} marked as present at {current_time}")
         conn.close()
 
-    # Process face detection and recognition from video stream
     def process(self, stream):
-        # Get faces known from "features_all.csv"
         if self.get_face_database():
-            while stream.isOpened():
-                self.frame_cnt += 1
-                logging.debug("Frame " + str(self.frame_cnt) + " starts")
-                flag, img_rd = stream.read()
-                kk = cv2.waitKey(1)
+            while True:
+                ret, img_rd = stream.read()
+                if not ret:
+                    break
 
-                # Detect faces in the frame
                 faces = detector(img_rd, 0)
+                self.current_frame_face_name_list = []
 
-                # Update count for faces in frames
-                self.last_frame_face_cnt = self.current_frame_face_cnt
-                self.current_frame_face_cnt = len(faces)
-
-                # Update the face name list in the last frame
-                self.last_frame_face_name_list = self.current_frame_face_name_list[:]
-
-                # Update frame centroid list
-                self.last_frame_face_centroid_list = self.current_frame_face_centroid_list
-                self.current_frame_face_centroid_list = []
-
-                # Handle no face changes
-                if (self.current_frame_face_cnt == self.last_frame_face_cnt) and (
-                        self.reclassify_interval_cnt != self.reclassify_interval):
-                    self.reclassify_interval_cnt += 1
-
-                if self.current_frame_face_cnt != 0:
-                    # Face recognition and extraction
+                if len(faces) > 0:
+                    recognized = False
                     for face in faces:
-                        x, y, w, h = (face.left(), face.top(), face.width(), face.height())
-                        face_img = img_rd[y:y + h, x:x + w]
-                        face_descriptor = face_reco_model.compute_face_descriptor(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB))
-                        self.current_frame_face_feature_list.append(list(face_descriptor))
-                        self.current_frame_face_position_list.append((x, y, w, h))
+                        shape = predictor(img_rd, face)
+                        face_feature = face_reco_model.compute_face_descriptor(img_rd, shape)
+                        distances = [self.return_euclidean_distance(face_feature, feature) for feature in self.face_features_known_list]
 
-                        self.current_frame_face_centroid_list.append(
-                            [(x + x + w) / 2, (y + y + h) / 2])
+                        if min(distances) < 0.6:
+                            name = self.face_name_known_list[distances.index(min(distances))]
+                            recognized = True
+                            self.attendance(name)
+                        else:
+                            name = "unknown"
 
-                        self.current_frame_face_name_list.append("Unknown")
+                        self.current_frame_face_name_list.append(name)
 
-                    if self.reclassify_interval_cnt == self.reclassify_interval:
-                        # Re-classify known faces
-                        self.reclassify_interval_cnt = 0
+                        # Draw face box and name
+                        cv2.rectangle(img_rd, (face.left(), face.top()), (face.right(), face.bottom()), (255, 255, 255), 2)
+                        cv2.putText(img_rd, name, (face.left(), face.top() - 10), self.font, 0.8, (0, 255, 255), 1)
 
-                        for i in range(self.current_frame_face_cnt):
-                            self.current_frame_face_X_e_distance_list = []
+                    # Send 0 if recognized face found
+                    ser.write(b'0')
+                else:
+                    # Send 1 if no face detected
+                    ser.write(b'1')
 
-                            # Calculate the Euclidean distance between the face in the current frame and all known faces
-                            for j in range(len(self.face_features_known_list)):
-                                self.current_frame_face_X_e_distance_list.append(self.return_euclidean_distance(
-                                    self.current_frame_face_feature_list[i],
-                                    self.face_features_known_list[j]
-                                ))
-
-                            # Assign the closest face from known faces
-                            min_distance_index = self.current_frame_face_X_e_distance_list.index(
-                                min(self.current_frame_face_X_e_distance_list))
-                            if min(self.current_frame_face_X_e_distance_list) < 0.6:
-                                self.current_frame_face_name_list[i] = self.face_name_known_list[min_distance_index]
-                                self.attendance(self.face_name_known_list[min_distance_index])
-
-                        # Track face centroids
-                        self.centroid_tracker()
-
-                # Update FPS
-                self.update_fps()
-
-                # Draw information on the frame
-                self.draw_note(img_rd)
-
-                # Display the frame
-                cv2.imshow("Face Recognition", img_rd)
-
-                # Exit the loop if 'q' is pressed
-                if kk == ord('q'):
+                cv2.imshow("Face Recognizer", img_rd)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
             stream.release()
             cv2.destroyAllWindows()
-        else:
-            logging.warning("Cannot process, face database not found!")
 
+# Start the face recognition process
+cap = cv2.VideoCapture(0)
+cv2.namedWindow("Face Recognizer", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("Face Recognizer", 640, 480)
 
-if __name__ == "__main__":
-    # Initialize face recognizer
-    face_recognizer = Face_Recognizer()
-    
-    # Open video capture
-    video_capture = cv2.VideoCapture(0)
-    
-    # Process video stream
-    face_recognizer.process(video_capture)
+recognizer = FaceRecognizer()
+recognizer.process(cap)
+
+# Cleanup
+ser.close()
