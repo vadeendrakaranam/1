@@ -18,9 +18,12 @@ face_reco_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recog
 
 # Relay GPIO setup
 RELAY_GPIO = 11
+RELAY_ON = GPIO.LOW   # Active LOW relay logic
+RELAY_OFF = GPIO.HIGH
+
 GPIO.setmode(GPIO.BOARD)
 GPIO.setup(RELAY_GPIO, GPIO.OUT)
-GPIO.output(RELAY_GPIO, GPIO.HIGH)  # Relay off initially
+GPIO.output(RELAY_GPIO, RELAY_OFF)  # Relay off initially
 
 # Create SQLite attendance database and table
 conn = sqlite3.connect("attendance.db")
@@ -96,13 +99,13 @@ class FaceRecognizer:
                 # Relay logic: Turn on for 10 seconds once a known face is detected
                 if known_face_detected:
                     if not self.relay_on:
-                        GPIO.output(RELAY_GPIO, GPIO.LOW)
+                        GPIO.output(RELAY_GPIO, RELAY_ON)
                         self.relay_triggered_time = current_time
                         self.relay_on = True
                         print("Relay ON (face matched)")
 
                 if self.relay_on and (current_time - self.relay_triggered_time >= 10):
-                    GPIO.output(RELAY_GPIO, GPIO.HIGH)
+                    GPIO.output(RELAY_GPIO, RELAY_OFF)
                     self.relay_on = False
                     print("Relay OFF")
 
@@ -115,7 +118,7 @@ class FaceRecognizer:
             cv2.destroyAllWindows()
             GPIO.cleanup()
 
-# Start the face recognition process 1
+# Start the face recognition process
 cap = cv2.VideoCapture(0)
 recognizer = FaceRecognizer()
 recognizer.process(cap)
