@@ -1,0 +1,124 @@
+import sys
+import os
+sys.path.insert(0, os.path.abspath("/home/project/Desktop/Att/lib"))
+
+import dlib
+import numpy as np
+import cv2
+import pandas as pd
+import time
+import sqlite3
+import datetime
+import RPi.GPIO as GPIO
+
+# Dlib face detector and shape predictor
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor('data/data_dlib/shape_predictor_68_face_landmarks.dat')
+face_reco_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recognition_resnet_model_v1.dat")
+
+# Relay GPIO setup
+RELAY_GPIO = 11
+RELAY_ON = GPIO.LOW   # Active LOW relay logic
+RELAY_OFF = GPIO.HIGH
+
+GPIO.setmode(GPIO.BOARD)
+GPIO.setup(RELAY_GPIO, GPIO.OUT)
+GPIO.output(RELAY_GPIO, RELAY_OFF)  # Relay off initially
+
+# Create SQLite attendance database and table
+conn = sqlite3.connect("attendance.db")
+cursor = conn.cursor()
+cursor.execute("CREATE TABLE IF NOT EXISTS attendance (name TEXT, time TEXT, date DATE, UNIQUE(name, date))")
+conn.commit()
+conn.close()
+
+class FaceRecognizer:
+    def __init__(self):
+        self.face_features_known_list = []
+        self.face_name_known_list = []
+        self.font = cv2.FONT_ITALIC
+        self.relay_triggered_time = 0
+        self.relay_on = False
+
+    def get_face_database(self):
+        if os.path.exists("data/features_all.csv"):
+            csv_rd = pd.read_csv("data/features_all.csv", header=None)
+            for i in range(csv_rd.shape[0]):
+                features = [csv_rd.iloc[i][j] for j in range(1, 129)]
+                self.face_name_known_list.append(csv_rd.iloc[i][0])
+                self.face_features_known_list.append(features)
+            return True
+        else:
+            print("'features_all.csv' not found!")
+            return False
+
+    def return_euclidean_distance(self, feature_1, feature_2):
+        return np.linalg.norm(np.array(feature_1) - np.array(feature_2))
+
+    def attendance(self, name):
+        current_date = datetime.datetime.now().strftime('%Y-%m-%d')
+        conn = sqlite3.connect("attendance.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM attendance WHERE name = ? AND date = ?", (name, current_date))
+        if not cursor.fetchone():
+            current_time = datetime.datetime.now().strftime('%H:%M:%S')
+            cursor.execute("INSERT INTO attendance (name, time, date) VALUES (?, ?, ?)", (name, current_time, current_date))
+            conn.commit()
+            print(f"{name} marked as present at {current_time}")
+        conn.close()
+
+    def process(self, stream):
+        if self.get_face_database():
+            stream.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+            stream.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+            while stream.isOpened():
+                ret, img_rd = stream.read()
+                if not ret:
+                    continue
+                faces = detector(img_rd, 0)
+
+                known_face_detected = False
+
+                for face in faces:
+                    shape = predictor(img_rd, face)
+                    face_feature = face_reco_model.compute_face_descriptor(img_rd, shape)
+                    distances = [self.return_euclidean_distance(face_feature, feature) for feature in self.face_features_known_list]
+
+                    if distances and min(distances) < 0.6:
+                        name = self.face_name_known_list[distances.index(min(distances))]
+                        self.attendance(name)
+                        known_face_detected = True
+                    else:
+                        name = "unknown"
+
+                    cv2.rectangle(img_rd, (face.left(), face.top()), (face.right(), face.bottom()), (255, 255, 255), 2)
+                    cv2.putText(img_rd, name, (face.left(), face.top() - 10), self.font, 0.8, (0, 255, 255), 1)
+
+                current_time = time.time()
+
+                # Relay logic: Turn on for 10 seconds once a known face is detected
+                if known_face_detected:
+                    if not self.relay_on:
+                        GPIO.output(RELAY_GPIO, RELAY_ON)
+                        self.relay_triggered_time = current_time
+                        self.relay_on = True
+                        print("Relay ON (face matched)")
+
+                if self.relay_on and (current_time - self.relay_triggered_time >= 10):
+                    GPIO.output(RELAY_GPIO, RELAY_OFF)
+                    self.relay_on = False
+                    print("Relay OFF")
+
+                cv2.imshow("Face Recognizer", img_rd)
+
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+            stream.release()
+            cv2.destroyAllWindows()
+            GPIO.cleanup()
+
+# Start the face recognition process
+cap = cv2.VideoCapture(0)
+recognizer = FaceRecognizer()
+recognizer.process(cap)
