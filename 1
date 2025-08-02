@@ -36,7 +36,6 @@ class FaceRecognizer:
         self.font = cv2.FONT_ITALIC
         self.relay_triggered_time = 0
         self.relay_on = False
-        self.cooldown_period = 30  # seconds
 
     def get_face_database(self):
         if os.path.exists("data/features_all.csv"):
@@ -94,9 +93,9 @@ class FaceRecognizer:
 
                 current_time = time.time()
 
-                # Relay logic with cooldown
+                # Relay logic: Turn on for 10 seconds once a known face is detected
                 if known_face_detected:
-                    if not self.relay_on and (current_time - self.relay_triggered_time > self.cooldown_period):
+                    if not self.relay_on:
                         GPIO.output(RELAY_GPIO, GPIO.LOW)
                         self.relay_triggered_time = current_time
                         self.relay_on = True
@@ -116,7 +115,7 @@ class FaceRecognizer:
             cv2.destroyAllWindows()
             GPIO.cleanup()
 
-# Start the face recognition process
+# Start the face recognition process 1
 cap = cv2.VideoCapture(0)
 recognizer = FaceRecognizer()
 recognizer.process(cap)
