@@ -1,37 +1,37 @@
 import sys
 import os
-import time
 import dlib
 import numpy as np
 import cv2
 import pandas as pd
+import time
 import sqlite3
 import datetime
 import serial
+import RPi.GPIO as GPIO
 
-# Add the 'lib' folder to Python's module search path
+# Add custom library path (optional)
 sys.path.insert(0, os.path.abspath("/home/project/Desktop/Att/lib"))
 
-# Serial port setup (update port if needed)
-ser = serial.Serial('/dev/ttyACM0', 9600, timeout=1)
-time.sleep(2)  # Wait for Arduino to reset
-
-# Dlib face detector and shape predictor
+# Dlib models
 detector = dlib.get_frontal_face_detector()
 predictor = dlib.shape_predictor('data/data_dlib/shape_predictor_68_face_landmarks.dat')
 face_reco_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recognition_resnet_model_v1.dat")
 
-# Create attendance table if it doesn't exist
+# Serial connection to Arduino (optional, not required for relay alone)
+arduino = serial.Serial('/dev/serial0', 9600, timeout=1)
+time.sleep(2)
+
+# Relay setup (GPIO17 = Pin 11)
+RELAY_GPIO = 17
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(RELAY_GPIO, GPIO.OUT)
+GPIO.output(RELAY_GPIO, GPIO.HIGH)  # Relay OFF initially (active LOW)
+
+# Create SQLite attendance database and table
 conn = sqlite3.connect("attendance.db")
 cursor = conn.cursor()
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS attendance (
-        name TEXT,
-        time TEXT,
-        date DATE,
-        UNIQUE(name, date)
-    )
-""")
+cursor.execute("CREATE TABLE IF NOT EXISTS attendance (name TEXT, time TEXT, date DATE, UNIQUE(name, date))")
 conn.commit()
 conn.close()
 
@@ -39,7 +39,6 @@ class FaceRecognizer:
     def __init__(self):
         self.face_features_known_list = []
         self.face_name_known_list = []
-        self.current_frame_face_name_list = []
         self.font = cv2.FONT_ITALIC
 
     def get_face_database(self):
@@ -62,9 +61,7 @@ class FaceRecognizer:
         conn = sqlite3.connect("attendance.db")
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM attendance WHERE name = ? AND date = ?", (name, current_date))
-        existing_entry = cursor.fetchone()
-
-        if not existing_entry:
+        if not cursor.fetchone():
             current_time = datetime.datetime.now().strftime('%H:%M:%S')
             cursor.execute("INSERT INTO attendance (name, time, date) VALUES (?, ?, ?)", (name, current_time, current_date))
             conn.commit()
@@ -73,54 +70,53 @@ class FaceRecognizer:
 
     def process(self, stream):
         if self.get_face_database():
-            while True:
+            while stream.isOpened():
                 ret, img_rd = stream.read()
                 if not ret:
                     break
 
                 faces = detector(img_rd, 0)
-                self.current_frame_face_name_list = []
+                known_face_detected = False
 
-                if len(faces) > 0:
-                    recognized = False
-                    for face in faces:
-                        shape = predictor(img_rd, face)
-                        face_feature = face_reco_model.compute_face_descriptor(img_rd, shape)
-                        distances = [self.return_euclidean_distance(face_feature, feature) for feature in self.face_features_known_list]
+                for face in faces:
+                    shape = predictor(img_rd, face)
+                    face_feature = face_reco_model.compute_face_descriptor(img_rd, shape)
+                    distances = [self.return_euclidean_distance(face_feature, feature) for feature in self.face_features_known_list]
 
-                        if min(distances) < 0.6:
-                            name = self.face_name_known_list[distances.index(min(distances))]
-                            recognized = True
-                            self.attendance(name)
-                        else:
-                            name = "unknown"
+                    if distances and min(distances) < 0.6:
+                        name = self.face_name_known_list[distances.index(min(distances))]
+                        self.attendance(name)
+                        known_face_detected = True
 
-                        self.current_frame_face_name_list.append(name)
+                        # === Relay ON for 5 seconds ===
+                        print("Relay ON (face matched)")
+                        GPIO.output(RELAY_GPIO, GPIO.LOW)
+                        time.sleep(5)
+                        GPIO.output(RELAY_GPIO, GPIO.HIGH)
+                        print("Relay OFF")
+                    else:
+                        name = "unknown"
 
-                        # Draw face box and name
-                        cv2.rectangle(img_rd, (face.left(), face.top()), (face.right(), face.bottom()), (255, 255, 255), 2)
-                        cv2.putText(img_rd, name, (face.left(), face.top() - 10), self.font, 0.8, (0, 255, 255), 1)
+                    # Draw rectangle and label
+                    cv2.rectangle(img_rd, (face.left(), face.top()), (face.right(), face.bottom()), (255, 255, 255), 2)
+                    cv2.putText(img_rd, name, (face.left(), face.top() - 10), self.font, 0.8, (0, 255, 255), 1)
 
-                    # Send 0 if recognized face found
-                    ser.write(b'0')
+                # Send signal to Arduino (optional)
+                if known_face_detected:
+                    arduino.write(b'1')
                 else:
-                    # Send 1 if no face detected
-                    ser.write(b'1')
+                    arduino.write(b'0')
 
                 cv2.imshow("Face Recognizer", img_rd)
+
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
             stream.release()
             cv2.destroyAllWindows()
+            GPIO.cleanup()
 
 # Start the face recognition process
 cap = cv2.VideoCapture(0)
-cv2.namedWindow("Face Recognizer", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("Face Recognizer", 640, 480)
-
 recognizer = FaceRecognizer()
 recognizer.process(cap)
-
-# Cleanup
-ser.close()
