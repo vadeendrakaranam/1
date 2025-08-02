@@ -1,5 +1,7 @@
 import sys
 import os
+sys.path.insert(0, os.path.abspath("/home/project/Desktop/Att/lib"))
+
 import dlib
 import numpy as np
 import cv2
@@ -10,28 +12,36 @@ import datetime
 import serial
 import RPi.GPIO as GPIO
 
-# Add custom library path (optional)
-sys.path.insert(0, os.path.abspath("/home/project/Desktop/Att/lib"))
+# GPIO Setup
+RELAY_GPIO = 11
+GPIO.setmode(GPIO.BOARD)
+GPIO.setup(RELAY_GPIO, GPIO.OUT)
+GPIO.output(RELAY_GPIO, GPIO.HIGH)  # Relay off initially
 
 # Dlib models
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor('data/data_dlib/shape_predictor_68_face_landmarks.dat')
-face_reco_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recognition_resnet_model_v1.dat")
+predictor_path = 'data/data_dlib/shape_predictor_68_face_landmarks.dat'
+face_rec_model_path = 'data/data_dlib/dlib_face_recognition_resnet_model_v1.dat'
 
-# Serial connection to Arduino (optional, not required for relay alone)
+# Load face detector and models
+detector = dlib.get_frontal_face_detector()
+predictor = dlib.shape_predictor(predictor_path)
+face_reco_model = dlib.face_recognition_model_v1(face_rec_model_path)
+
+# Serial to Arduino
 arduino = serial.Serial('/dev/serial0', 9600, timeout=1)
 time.sleep(2)
 
-# Relay setup (GPIO17 = Pin 11)
-RELAY_GPIO = 17
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(RELAY_GPIO, GPIO.OUT)
-GPIO.output(RELAY_GPIO, GPIO.HIGH)  # Relay OFF initially (active LOW)
-
-# Create SQLite attendance database and table
+# Create SQLite database
 conn = sqlite3.connect("attendance.db")
 cursor = conn.cursor()
-cursor.execute("CREATE TABLE IF NOT EXISTS attendance (name TEXT, time TEXT, date DATE, UNIQUE(name, date))")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS attendance (
+        name TEXT,
+        time TEXT,
+        date DATE,
+        UNIQUE(name, date)
+    )
+""")
 conn.commit()
 conn.close()
 
@@ -40,6 +50,8 @@ class FaceRecognizer:
         self.face_features_known_list = []
         self.face_name_known_list = []
         self.font = cv2.FONT_ITALIC
+        self.relay_triggered_time = 0
+        self.relay_on = False
 
     def get_face_database(self):
         if os.path.exists("data/features_all.csv"):
@@ -65,7 +77,7 @@ class FaceRecognizer:
             current_time = datetime.datetime.now().strftime('%H:%M:%S')
             cursor.execute("INSERT INTO attendance (name, time, date) VALUES (?, ?, ?)", (name, current_time, current_date))
             conn.commit()
-            print(f"{name} marked as present at {current_time}")
+            print(f"{name} marked present at {current_time}")
         conn.close()
 
     def process(self, stream):
@@ -73,42 +85,43 @@ class FaceRecognizer:
             while stream.isOpened():
                 ret, img_rd = stream.read()
                 if not ret:
-                    break
+                    continue
 
                 faces = detector(img_rd, 0)
                 known_face_detected = False
+                current_time = time.time()
 
                 for face in faces:
                     shape = predictor(img_rd, face)
                     face_feature = face_reco_model.compute_face_descriptor(img_rd, shape)
-                    distances = [self.return_euclidean_distance(face_feature, feature) for feature in self.face_features_known_list]
+                    distances = [self.return_euclidean_distance(face_feature, feat) for feat in self.face_features_known_list]
 
                     if distances and min(distances) < 0.6:
                         name = self.face_name_known_list[distances.index(min(distances))]
                         self.attendance(name)
                         known_face_detected = True
-
-                        # === Relay ON for 5 seconds ===
-                        print("Relay ON (face matched)")
-                        GPIO.output(RELAY_GPIO, GPIO.LOW)
-                        time.sleep(5)
-                        GPIO.output(RELAY_GPIO, GPIO.HIGH)
-                        print("Relay OFF")
                     else:
                         name = "unknown"
 
-                    # Draw rectangle and label
                     cv2.rectangle(img_rd, (face.left(), face.top()), (face.right(), face.bottom()), (255, 255, 255), 2)
                     cv2.putText(img_rd, name, (face.left(), face.top() - 10), self.font, 0.8, (0, 255, 255), 1)
 
-                # Send signal to Arduino (optional)
-                if known_face_detected:
-                    arduino.write(b'1')
-                else:
-                    arduino.write(b'0')
+                # Relay logic
+                if known_face_detected and not self.relay_on:
+                    GPIO.output(RELAY_GPIO, GPIO.LOW)
+                    self.relay_triggered_time = current_time
+                    self.relay_on = True
+                    print("Relay ON (face matched)")
+
+                if self.relay_on and (current_time - self.relay_triggered_time >= 5):
+                    GPIO.output(RELAY_GPIO, GPIO.HIGH)
+                    self.relay_on = False
+                    print("Relay OFF")
+
+                # Arduino signal
+                arduino.write(b'1' if known_face_detected else b'0')
 
                 cv2.imshow("Face Recognizer", img_rd)
-
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
@@ -116,7 +129,10 @@ class FaceRecognizer:
             cv2.destroyAllWindows()
             GPIO.cleanup()
 
-# Start the face recognition process
+# Start
 cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+
 recognizer = FaceRecognizer()
 recognizer.process(cap)
